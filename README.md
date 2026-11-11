@@ -36,6 +36,7 @@ code it covers changes, or when the approved rules are edited.
 ```bash
 git clone https://github.com/AswinSreenivas/formal-verify-skill ~/.claude/skills/formal-verify
 ~/.claude/skills/formal-verify/fv doctor     # shows what's missing
+~/.claude/skills/formal-verify/fv selftest   # after installing a checker: negative controls, ~10 s
 ```
 
 Checkers (install whichever you need):
@@ -57,7 +58,16 @@ In Claude Code, inside your repo:
 /formal-verify src/billing.py:allocate_units
 /formal-verify "a cancelled request never cancels another request's write"
 /formal-verify                      # every function changed vs the default branch
+/formal-verify --pr 1234            # every function changed in a GitHub PR
 ```
+
+### PR mode
+
+`--pr N` reads the code from the PR's head commit, via `gh` and `git fetch`. It never checks out the
+PR or touches your working tree, so it works from any checkout. `fv report --pr N` prints a markdown
+section for the PR body: one row per changed function (proved / skipped with a reason / bug / needs
+proof), plus a one-line Proof-of-Validation summary. It exits non-zero until every changed function
+is proved or deliberately skipped. Nothing is posted to GitHub.
 
 ## Limits
 
@@ -67,8 +77,10 @@ In Claude Code, inside your repo:
   - stale detection.
 - A proof only covers the approved rules, over the approved input range or (TLA+) size bounds.
 - Dafny's `real` is exact math, not IEEE floats.
-- **Status:** the checker-side output parsing hasn't been exercised against real Dafny/TLC runs yet.
-  SKILL.md lists negative controls to run first. Please open an issue if something misparses.
+- `fv` reads checker output with regexes. `fv selftest` runs negative controls covering a correct
+  model, a broken one, an empty one, a vacuous one, an unsatisfiable `Init`, and an unparseable
+  mutant, and checks that each is classified right. Tested with Dafny 4.11 and TLA+ tools 1.7.4.
+  Re-run it after upgrading either one, and open an issue if a control fails.
 
 ## Credits
 

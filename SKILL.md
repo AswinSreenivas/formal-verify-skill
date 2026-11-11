@@ -1,6 +1,6 @@
 ---
 name: formal-verify
-description: Formally verify a piece of logic on demand, in any repo — a Python or TypeScript function, a rule buried in SQL/Spark, a race or ordering question ("can an abort kill a sibling request?"), a plain-English invariant, or every function changed in the current diff (e.g. right before opening a PR). Claude drafts the rules, the user approves them, Claude writes a model (Dafny for per-input logic, TLA+ for event ordering) with file:line pointers to the real code, the checker verifies it, deliberately broken mutants must each be caught, and any counterexample is replayed against the real code. Use when the user says "/formal-verify", "formally verify X", "prove X", "model-check this race", "prove this always holds", "verify this logic", or "check the diff".
+description: Formally verify a piece of logic on demand, in any repo — a Python or TypeScript function, a rule buried in SQL/Spark, a race or ordering question ("can an abort kill a sibling request?"), a plain-English invariant, every function changed in the current diff, or every function changed in a GitHub PR (`--pr N`, read from the PR's head without switching branches) with a paste-ready report for the PR body. Claude drafts the rules, the user approves them, Claude writes a model (Dafny for per-input logic, TLA+ for event ordering) with file:line pointers to the real code, the checker verifies it, deliberately broken mutants must each be caught, and any counterexample is replayed against the real code. Use when the user says "/formal-verify", "formally verify X", "prove X", "model-check this race", "prove this always holds", "verify this logic", "check the diff", "formally verify PR 1234", or "verify this PR".
 ---
 
 # formal-verify
@@ -18,17 +18,24 @@ Everything Claude writes after that is checked, and the check itself must be sho
 ```bash
 F=~/.claude/skills/formal-verify/fv
 $F doctor                     # dafny / java / tla2tools present? flags? free disk
-$F targets                    # changed .py/.ts functions vs the default branch (+ uncommitted, untracked) and their proof state
+$F selftest                   # negative controls: does fv still read Dafny/TLC output right? (~10 s)
+$F targets [--base B]         # changed .py/.ts functions vs the default branch (+ uncommitted, untracked) and their proof state
 $F snapshot <file>:<func>     # create/refresh the proof dir, pin a hash of the source
 $F snapshot english:<slug> --statement "EOP(N) = BOP(N+1)"
+$F skip <file>:<func> --note "plumbing: ..."   # record a triaged skip; goes stale when the code changes
 $F approve <dir>              # ONLY after the user approves the rule files
 $F check <dir>                # check the model, then run every mutant (each must FAIL)
-$F mark <dir> bug|model-mismatch|unconfirmed|gave_up --note "..."
+$F mark <dir> bug|model-mismatch|unconfirmed|gave_up|skipped --note "..."
 $F status                     # every proof for this repo; stale ones flagged
-$F report                     # summary + a paste-ready Proof-of-Validation row
+$F report [--base B | --all]  # markdown table for the current diff + a paste-ready Proof-of-Validation row
 ```
 
-Proof dirs: `~/.claude/formal-proofs/<repo>/<file-slug>.<func>/`
+Every command except `doctor`, `selftest`, `approve` and `mark` takes `--pr N`. See **PR mode** below.
+In zsh (the Bash tool's shell), write targets as `"${T}:func"` or as a literal path. `$T:a…` is read
+as zsh's `:a` path modifier and mangles the target.
+
+Proof dirs: `~/.claude/formal-proofs/<repo>/<file-slug>.<func>/`. `<repo>` is the main checkout's
+name, so every worktree of a repo shares one store.
 
 | File | Dafny | TLA+ |
 |---|---|---|
@@ -51,13 +58,15 @@ flags `stale` (the code moved) and `rule-changed` (the rules were edited after a
 | logic inside SQL or Spark | snapshot the Python/TS function that builds or runs it. The model is of the SQL semantics |
 | an ordering / race question | snapshot the function where the steps happen, or `english:<slug>` if it spans services |
 | a plain-English invariant | `fv snapshot english:<slug> --statement "..."` |
-| no argument | `fv targets`. Skip every target already `fresh` + `proved`. Others go to step 2 |
+| no argument | `fv targets`. Skip every target already `fresh` + `proved`/`skipped`. Others go to step 2 |
+| a PR (`--pr N`, `#N`, a PR URL, "this PR") | follow **PR mode** below |
 
 Triage each remaining target in one line:
 - **verifiable**: there is logic worth stating as rules (arithmetic, allocation, rounding,
   date/period math, state transitions, filters, ordering of concurrent steps);
-- **skip — <reason>**: plumbing, IO, logging, wiring. Tell the user what was skipped and why.
-  Don't model plumbing.
+- **skip — <reason>**: plumbing, IO, logging, wiring. Tell the user what was skipped and why, and
+  record it with `fv skip <file>:<func> --note "<reason>"` so the report shows it as a decision,
+  not a gap. Don't model plumbing.
 
 ### 2. Let the question choose the tool
 
@@ -170,7 +179,10 @@ model, so they keep the same `include`/`MODULE Model` header.
 | `needs-mutants` | no mutants yet | write them |
 | `failed` | the model itself fails | step 6 |
 
-A mutant that doesn't compile or parse is `INVALID` and counts for nothing. Fix it.
+A mutant that never really got checked is `INVALID` and counts for nothing. Fix it. That covers a
+parse or type error, a timeout, a Dafny warning such as a method left without a body, "0 verified",
+and a TLA+ spec with no reachable states. The same conditions make the model itself `failed`, never
+`proved`.
 
 ### 6. When the model fails
 
@@ -206,12 +218,36 @@ the bug; the user decides.
 
 ### 7. Report
 
-Run `fv report` and relay a short table: target → tool → proved / bug (with input or steps) /
-unconfirmed / gave_up / skipped (reason). Always include:
+Run `fv report` (or `fv report --pr N`) and relay a short table: target → tool → proved / bug (with
+input or steps) / unconfirmed / gave_up / skipped (reason). Always include:
 - its caveats line;
-- for TLA+, the bounds.
+- for TLA+, the bounds (the report prints them on each proved TLA+ row).
 
-The last line is a "Proof of Validation" row the user can paste into a PR body.
+`fv report` covers the functions the diff changes, plus `english:` proofs tied to this branch or
+PR. `--all` covers every proof in the repo. The output is markdown: a `### Formal verification` section
+for the PR body, then a "Proof of Validation" row in the `git-pr` template's `| command | result |`
+shape. It exits 0 only when every target is `proved` or `skipped`, and lists the rest on stderr.
+
+## PR mode
+
+`--pr N` reads every source from PR N's head commit. `fv` runs `gh pr view N` for the base branch and
+head SHA, then `git fetch origin pull/N/head <base>`. The working tree and the current branch are
+never touched, so this works from any checkout, including the main one on a release branch.
+
+1. `fv targets --pr N`: the PR's changed functions (merge-base..head, tests excluded) and their
+   proof state.
+2. Triage every row (step 1). `fv skip <file>:<func> --note "..." --pr N` for plumbing. For the rest,
+   use `fv snapshot <file>:<func> --pr N` and steps 2–6, running `fv check <dir> --pr N`.
+   Pointers are checked against the PR's version of the file.
+3. An invariant that spans the PR (`english:<slug>`): `fv snapshot english:<slug> --statement "..."
+   --pr N` ties it to the PR, so the PR report includes it.
+4. `fv report --pr N`, then hand the user the markdown section and the Proof-of-Validation row for
+   the PR body. Print only: never post to the PR or edit its body yourself.
+
+Freshness is judged against the source you name. A proof made with `--pr N` is `fresh` under
+`--pr N`, and may read `stale` or `source-missing` from a checkout on another branch. When the PR gets
+new commits, re-run `fv report --pr N`: any proved function whose code moved shows as `stale` and
+needs `snapshot` + `check` again.
 
 ## Limits (say these, don't hide them)
 
@@ -228,34 +264,16 @@ The last line is a "Proof of Validation" row the user can paste into a PR body.
   - TLC: 4 workers, 4 GB heap, 600 s cap per run. If it hits the cap, shrink the bounds.
   - The real cost is tokens, which is why the attempt cap exists.
 
-## First run after installing (not yet done)
-
-None of the checker side has been exercised yet:
-- Dafny refinement;
-- the flag names;
-- error/summary parsing, including the "Related location" lines that map a mutant's failure to its
-  rule;
-- TLC output parsing.
-
-Before trusting any `PROVED`, run these **negative controls** first:
-
-**Dafny:**
-1. `module Model refines Rule { }`, which supplies no body. Must not print PROVED.
-2. A body that violates one `ensures`. Must FAIL and name that rule's line.
-
-**TLA+:**
-1. A model whose `Next` breaks an invariant. Must FAIL and name the invariant.
-2. A `Next == UNCHANGED vars` model. Its mutants must SURVIVE, so the outcome is `mutant-survived`.
-
-If a mutant's failure isn't mapped to its rule, fix the parsing in `fv` before trusting coverage.
-After these pass, delete this section.
-
-`fv targets` diffs against the remote's default branch (`origin/HEAD`, else `origin/main`). On a long-lived
-branch (e.g. a release branch), pass `--base`, or it lists hundreds of functions.
+- `fv targets` / `fv report` without `--pr` diff against the remote's default branch (`origin/HEAD`,
+  else `origin/main`). On a long-lived branch (e.g. a release branch), pass `--base`, or `--pr N`,
+  or it lists hundreds of functions.
+- `--pr N` sees only what is pushed to the PR. Uncommitted work is checked without `--pr`.
 
 ## Setup
 
-`fv doctor`. Ask the user before installing anything:
+`fv doctor`. Ask the user before installing anything. After installing or upgrading a checker, run
+`fv selftest`. Until it passes, don't trust any `PROVED`: `fv` reads checker output with regexes,
+and a new checker version can change that output.
 
 | Tool | Install | Notes |
 |---|---|---|

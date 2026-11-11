@@ -5,13 +5,19 @@ Claude writes the models; fv finds targets, pins source + rules, runs the checke
 See SKILL.md next to this file.
 
     fv doctor                                   # dafny / java / tla2tools present? flags? disk
-    fv targets [--base origin/main]             # changed functions in the diff + proof status
+    fv selftest                                 # negative controls: does fv still read the checkers right?
+    fv targets [--base B | --pr N]              # changed functions in the diff + proof status
     fv snapshot <file:name> | english:<slug>    # create/refresh a proof dir, pin the source hash
+    fv skip <file:name> --note "why"            # record a deliberate skip (plumbing, IO, ...)
     fv approve <proof-dir>                      # the user approved the rule files: pin their hash
     fv check <proof-dir>                        # check the model, then every mutant must FAIL
-    fv mark <proof-dir> <outcome> [--note ..]   # bug | model-mismatch | unconfirmed | gave_up
+    fv mark <proof-dir> <outcome> [--note ..]   # bug | model-mismatch | unconfirmed | gave_up | skipped
     fv status                                   # every proof for this repo, stale ones flagged
-    fv report                                   # summary + one Proof-of-Validation row
+    fv report [--base B | --pr N | --all]       # markdown for the PR body + a Proof-of-Validation row
+
+--pr N (on targets, snapshot, skip, check, status, report) reads the code from PR N's
+head commit — fetched with gh + git fetch, the working tree is never touched — so it
+works from any checkout of the repo without switching branches.
 
 A proof dir holds either a Dafny proof (rule.dfy + model.dfy) or a TLA+ model
 (rule.tla + rule.cfg + Model.tla), plus mutant_<name>.dfy / mutant_<name>.tla:
@@ -19,8 +25,8 @@ deliberately broken copies of the model. `proved` needs the model to pass AND
 every rule to be broken by at least one mutant that the checker catches.
 
 Proof dirs live in ~/.claude/formal-proofs/<repo>/<slug>/ and survive across
-sessions. A proof counts only while source.sha matches the current code AND
-the rule files match the hash pinned by `fv approve`.
+sessions; every worktree of a repo shares them. A proof counts only while
+source.sha matches the code AND the rule files match the hash pinned by `fv approve`.
 """
 import argparse
 import ast
@@ -57,6 +63,11 @@ TLC_HEAP = "-Xmx4g"  # 16 GB machine; TLC's state store spills to the temp metad
 POINTER = re.compile(r"([\w./-]+\.(?:py|ts|tsx|sql)):(\d+)")
 TEST_PATH = re.compile(r"(^|/)tests?/|(^|/)test_[^/]*\.py$|_test\.py$|\.(test|spec)\.ts$")
 LANG_BY_EXT = {".py": "python", ".ts": "typescript"}
+ENGINE_LABEL = {"dafny": "Dafny", "tla": "TLA+"}
+# A verdict that closes a changed function for the PR gate.
+GATE_OK = ("proved", "skipped")
+# A proof-dir state under which the recorded outcome no longer describes the code or rules.
+NOT_CURRENT = ("stale", "rule-changed", "unapproved", "source-missing", "no-source-ref")
 
 
 def sh(cmd, cwd=None, check=True):
@@ -73,8 +84,22 @@ def repo_root():
     return Path(p.stdout.strip())
 
 
+def repo_name(root):
+    """The repo's name, the same from every worktree: the main checkout's dir (or bare repo name)."""
+    p = sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=root, check=False)
+    common = Path(p.stdout.strip()) if p.returncode == 0 and p.stdout.strip() else root / ".git"
+    name = common.parent.name if common.name == ".git" else common.name
+    return name[:-4] if name.endswith(".git") else name
+
+
 def proofs_dir(root):
-    return PROOFS_ROOT / root.name
+    return PROOFS_ROOT / repo_name(root)
+
+
+def current_branch(root):
+    p = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root, check=False)
+    b = p.stdout.strip()
+    return b if p.returncode == 0 and b and b != "HEAD" else None
 
 
 def sha(text):
@@ -95,6 +120,46 @@ def read_json(path, default=None):
 
 def write_json(path, data):
     path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+# ── where the code is read from ──────────────────────────────────────────────
+
+class Source:
+    """The working tree (default), or one commit — a PR's head in PR mode."""
+
+    def __init__(self, root, commit=None, label="working tree", pr=None):
+        self.root, self.commit, self.label, self.pr = root, commit, label, pr
+
+    def read(self, rel):
+        if self.commit is None:
+            path = self.root / rel
+            return path.read_text() if path.is_file() else None
+        p = sh(["git", "show", f"{self.commit}:{rel}"], cwd=self.root, check=False)
+        return p.stdout if p.returncode == 0 else None
+
+
+def resolve_pr(root, number):
+    """PR → its info + base ref. Fetches the PR head and base branch; never touches the working tree."""
+    out = sh(["gh", "pr", "view", str(number), "--json",
+              "number,url,state,baseRefName,headRefName,headRefOid"], cwd=root).stdout
+    info = json.loads(out)
+    sh(["git", "fetch", "-q", "origin", f"pull/{number}/head", info["baseRefName"]], cwd=root)
+    head = info["headRefOid"]
+    if sh(["git", "cat-file", "-e", f"{head}^{{commit}}"], cwd=root, check=False).returncode != 0:
+        sys.exit(f"fv: PR #{number} head {head[:10]} isn't in the fetched objects — it was probably "
+                 "pushed a moment ago; re-run")
+    info["base"] = f"origin/{info['baseRefName']}"
+    return info
+
+
+def source_for(root, args):
+    """(Source, PR info or None) from the command's --pr flag."""
+    number = getattr(args, "pr", None)
+    if number is None:
+        return Source(root), None
+    info = resolve_pr(root, number)
+    head = info["headRefOid"]
+    return Source(root, head, f"PR #{number} @ {head[:10]}", pr=number), info
 
 
 # ── source extraction ────────────────────────────────────────────────────────
@@ -158,7 +223,7 @@ def ts_functions(text):
 
 
 def functions_in(path, text):
-    lang = LANG_BY_EXT.get(path.suffix)
+    lang = LANG_BY_EXT.get(Path(path).suffix)
     if lang == "python":
         return py_functions(text)
     if lang == "typescript":
@@ -166,27 +231,37 @@ def functions_in(path, text):
     return []
 
 
-def extract(root, ref):
-    """Source snippet for 'path:name'. Returns (relpath, name, lang, snippet)."""
+def repo_relpath(root, rel):
+    p = Path(rel)
+    if p.is_absolute():
+        try:
+            p = p.resolve().relative_to(root.resolve())
+        except ValueError:
+            sys.exit(f"fv: {rel} is outside the repo {root}")
+    return Path(os.path.normpath(p)).as_posix()
+
+
+def extract(root, ref, src):
+    """Source snippet for 'path:name' as `src` sees it. Returns (relpath, name, lang, snippet)."""
     rel, _, name = ref.rpartition(":")
     if not rel or not name:
         sys.exit(f"fv: target must be <file>:<function> (or english:<slug>), got {ref!r}")
-    path = (root / rel).resolve()
-    if not path.is_file():
-        sys.exit(f"fv: no such file {rel}")
-    lang = LANG_BY_EXT.get(path.suffix)
+    rel = repo_relpath(root, rel)
+    lang = LANG_BY_EXT.get(Path(rel).suffix)
     if not lang:
-        sys.exit(f"fv: {path.suffix} not supported for snapshot; use english:<slug> and model it by hand")
-    text = path.read_text()
+        sys.exit(f"fv: {Path(rel).suffix} not supported for snapshot; use english:<slug> and model it by hand")
+    text = src.read(rel)
+    if text is None:
+        sys.exit(f"fv: no such file {rel} in the {src.label}")
     lines = text.splitlines()
-    matches = [f for f in functions_in(path, text) if f[0] == name or f[0].endswith("." + name)]
+    matches = [f for f in functions_in(rel, text) if f[0] == name or f[0].endswith("." + name)]
     if not matches:
-        sys.exit(f"fv: no function {name!r} in {rel}")
+        sys.exit(f"fv: no function {name!r} in {rel} ({src.label})")
     if len(matches) > 1:
         names = ", ".join(f"{n} (line {s})" for n, s, _ in matches)
         sys.exit(f"fv: {name!r} is ambiguous in {rel}: {names}; use Class.method")
     qname, start, end = matches[0]
-    return str(path.relative_to(root)), qname, lang, "\n".join(lines[start - 1:end])
+    return rel, qname, lang, "\n".join(lines[start - 1:end])
 
 
 def slug_for(rel, name):
@@ -198,11 +273,14 @@ def slug_for(rel, name):
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
-def changed_ranges(root, base):
-    """{relpath: [(start, end), ...] or None for 'whole file'} — committed + uncommitted + untracked."""
-    sh(["git", "fetch", "-q", "origin", base.split("/", 1)[-1]], cwd=root, check=False)
-    mb = sh(["git", "merge-base", base, "HEAD"], cwd=root).stdout.strip()
-    diff = sh(["git", "diff", "-U0", "--no-color", mb, "--", "*.py", "*.ts"], cwd=root).stdout
+def changed_ranges(root, base, head=None):
+    """{relpath: [(start, end), ...] or None for 'whole file'}.
+    head=None: merge-base..working tree, plus untracked files. head=<commit>: merge-base..head only."""
+    if head is None:
+        sh(["git", "fetch", "-q", "origin", base.split("/", 1)[-1]], cwd=root, check=False)
+    mb = sh(["git", "merge-base", base, head or "HEAD"], cwd=root).stdout.strip()
+    cmd = ["git", "diff", "-U0", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", mb]
+    diff = sh(cmd + ([head] if head else []) + ["--", "*.py", "*.ts"], cwd=root).stdout
     ranges, cur = {}, None
     for line in diff.splitlines():
         if line.startswith("+++ "):
@@ -213,10 +291,29 @@ def changed_ranges(root, base):
             start, count = int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1)
             # a pure deletion (count 0) still changes the function around it
             ranges[cur].append((start, start + max(count, 1) - 1))
-    untracked = sh(["git", "ls-files", "--others", "--exclude-standard", "--", "*.py", "*.ts"], cwd=root).stdout
-    for rel in untracked.split():
-        ranges[rel] = None
+    if head is None:
+        untracked = sh(["git", "ls-files", "--others", "--exclude-standard", "--", "*.py", "*.ts"], cwd=root).stdout
+        for rel in untracked.split():
+            ranges[rel] = None
     return {r: v for r, v in ranges.items() if not TEST_PATH.search(r) and not r.endswith(".d.ts")}
+
+
+def changed_functions(root, src, base, head=None):
+    """[(relpath, name, start, end)] for every function the diff touches, read from `src`."""
+    out = []
+    for rel, hunks in sorted(changed_ranges(root, base, head).items()):
+        text = src.read(rel)
+        if text is None:
+            continue
+        for name, start, end in functions_in(rel, text):
+            if hunks is None or any(s <= end and e >= start for s, e in hunks):
+                out.append((rel, name, start, end))
+    return out
+
+
+def default_base(root):
+    p = sh(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd=root, check=False)
+    return p.stdout.strip() if p.returncode == 0 and p.stdout.strip() else "origin/main"
 
 
 # ── proof dir state ──────────────────────────────────────────────────────────
@@ -231,24 +328,33 @@ def rule_hash(d):
     return sha("\n".join(f"{p.name}\n{p.read_text()}" for p in files)) if files else None
 
 
-def proof_state(root, d):
-    """fresh | stale | rule-changed | unapproved | source-missing | english, plus the outcome."""
+def proof_state(root, d, src):
+    """(state, outcome, ref). state is fresh | stale | source-missing | english | no-source-ref,
+    or unapproved | rule-changed when the rule files aren't the approved ones. A skip has no rules,
+    so only the code decides whether it still holds."""
     ref = read_json(d / "source.ref", {}) or {}
     result = read_json(d / "result.json", {}) or {}
     outcome = result.get("outcome", "unchecked")
+    if ref.get("kind") == "english":
+        state = "english"
+    elif ref.get("kind") == "code" and ref.get("file") and ref.get("name"):
+        try:
+            _, _, _, snippet = extract(root, f"{ref['file']}:{ref['name']}", src)
+        except SystemExit:
+            state = "source-missing"
+        else:
+            pinned = (d / "source.sha").read_text().strip() if (d / "source.sha").exists() else None
+            state = "fresh" if sha(snippet) == pinned else "stale"
+    else:
+        state = "no-source-ref"
+    if outcome == "skipped" or state == "no-source-ref":
+        return state, outcome, ref
     approved = (d / "rule.sha").read_text().strip() if (d / "rule.sha").exists() else None
     if not approved:
         return "unapproved", outcome, ref
     if rule_hash(d) != approved:
         return "rule-changed", outcome, ref
-    if ref.get("kind") == "english":
-        return "english", outcome, ref
-    try:
-        _, _, _, snippet = extract(root, f"{ref['file']}:{ref['name']}")
-    except SystemExit:
-        return "source-missing", outcome, ref
-    pinned = (d / "source.sha").read_text().strip() if (d / "source.sha").exists() else None
-    return ("fresh" if sha(snippet) == pinned else "stale"), outcome, ref
+    return state, outcome, ref
 
 
 def all_proofs(root):
@@ -268,9 +374,11 @@ def resolve_dir(root, arg):
 
 # ── checkers ─────────────────────────────────────────────────────────────────
 # Each engine runs one model file and returns
-#   {"ok": True|False|None, "violated": set of rule ids, "errors": [...], "stats": {...}, "log": str}
-# ok=None means the file never reached verification (parse/type error) — such a
-# mutant proves nothing, so it never counts as "caught".
+#   {"ok": True|False|None, "violated": set of rule ids, "errors": [...], "why": str, "stats": {...}, "log": str}
+# ok=False: the checker reached the rules and found a violation (a real counterexample).
+# ok=None:  nothing was really checked — parse/type error, timeout, a body-less method,
+#           zero reachable states. Such a mutant proves nothing, so it never counts as "caught",
+#           and such a model never counts as passing.
 
 def dafny_flags(dafny):
     help_text = sh([dafny, "verify", "--help"], check=False)
@@ -308,8 +416,10 @@ def run(cmd, cwd):
         return -1, f"fv: timed out after {CHECK_TIMEOUT_S}s — shrink the bounds or split the rule"
 
 
-ERROR_LINE = re.compile(r"^(?P<file>[^\s(]+\.dfy)\((?P<line>\d+),(?P<col>\d+)\): (?P<kind>Error|Related location)[^:]*: (?P<msg>.*)$")
-SUMMARY = re.compile(r"finished with (\d+) verified, (\d+) errors?")
+DAFNY_LINE = re.compile(r"^(?P<file>[^\s(]+\.dfy)\((?P<line>\d+),(?P<col>\d+)\): "
+                        r"(?P<kind>Error|Warning|Related location)[^:]*: (?P<msg>.*)$")
+SUMMARY = re.compile(r"finished with (\d+) verified, (\d+) errors?[^\n]*")
+INCOMPLETE = re.compile(r"time ?outs?|timed out|out of resource|inconclusive", re.I)
 
 
 def dafny_rules(d):
@@ -322,18 +432,45 @@ def run_dafny(d, model_name):
     dafny = find_dafny()
     flags, _ = dafny_flags(dafny)
     code, out = run([dafny, "verify", *flags, model_name], d)
-    errors = [m.groupdict() for m in map(ERROR_LINE.match, out.splitlines()) if m]
+    entries = [m.groupdict() for m in map(DAFNY_LINE.match, out.splitlines()) if m]
+    # An Error is a counterexample unless it is a timeout. Its "Related location" lines that land in
+    # rule.dfy name the approved ensures it broke; those after a Warning (e.g. "this ensures is part
+    # of a bodyless method") broke nothing.
+    violated, failures, warnings, primary = set(), [], [], None
+    for e in entries:
+        if e["kind"] == "Related location":
+            if primary == "failure" and Path(e["file"]).name == "rule.dfy":
+                violated.add(f"rule.dfy:{e['line']}")
+            continue
+        if e["kind"] == "Warning":
+            primary = "warning"
+            warnings.append(e)
+        elif INCOMPLETE.search(e["msg"]):
+            primary = "incomplete"
+        else:
+            primary = "failure"
+            failures.append(e)
+            if Path(e["file"]).name == "rule.dfy":
+                violated.add(f"rule.dfy:{e['line']}")
     summary = SUMMARY.search(out)
-    # which approved ensures were broken: Dafny points at them as rule.dfy locations
-    violated = {f"rule.dfy:{e['line']}" for e in errors if Path(e["file"]).name == "rule.dfy"}
-    if code == 0 and not errors:
-        ok = True
-    elif summary:
-        ok = False
+    verified = int(summary.group(1)) if summary else None
+    incomplete = bool(summary and INCOMPLETE.search(summary.group(0)))
+    if summary and failures:
+        ok, why = False, "counterexample"
+    elif code == 0 and summary and verified and not warnings and not incomplete:
+        ok, why = True, ""
+    elif not summary:
+        ok, why = None, "never reached the verifier (parse / resolution / type error)"
+    elif incomplete:
+        ok, why = None, "verification timed out or ran out of resources"
+    elif warnings:
+        ok, why = None, f"{len(warnings)} warning(s), e.g. a method with no body: {warnings[0]['msg'][:90]}"
+    elif not verified:
+        ok, why = None, "0 verified — nothing was checked"
     else:
-        ok = None  # resolution / parse / type error: never reached the verifier
-    stats = {"verified": int(summary.group(1)) if summary else None}
-    return {"ok": ok, "violated": violated, "errors": errors[:20], "stats": stats, "log": out}
+        ok, why = None, f"dafny exited {code} without a counterexample"
+    stats = {"verified": verified}
+    return {"ok": ok, "violated": violated, "errors": entries[:20], "why": why, "stats": stats, "log": out}
 
 
 TLC_VIOLATION = re.compile(r"Error: (?:Invariant|Property|Action property) (\w+) is violated")
@@ -360,6 +497,24 @@ def tla_rules(d):
     return names
 
 
+def tla_bounds(d):
+    """The CONSTANTS lines of rule.cfg, e.g. 'Requests = {r1, r2}; Years = 3' — a TLC pass holds only within them."""
+    out, mode = [], False
+    for raw in (d / "rule.cfg").read_text().splitlines():
+        line = raw.split("\\*")[0].strip()
+        if not line:
+            continue
+        head, _, rest = line.partition(" ")
+        if head.upper() in ("CONSTANT", "CONSTANTS"):
+            mode, line = True, rest.strip()
+        elif re.match(r"^[A-Z_]+$", head):
+            mode = False
+            continue
+        if mode and line:
+            out.append(line)
+    return "; ".join(out)
+
+
 def run_tla(d, model_name):
     java, jar = find_java(), find_tla_jar()
     if not java:
@@ -383,16 +538,20 @@ def run_tla(d, model_name):
     if "Deadlock reached" in out:
         violated.add("deadlock")
     states = TLC_STATES.search(out)
-    stats = {"distinct_states": int(states.group(2).replace(",", "")) if states else None,
+    distinct = int(states.group(2).replace(",", "")) if states else None
+    stats = {"distinct_states": distinct,
              "trace_steps": len(re.findall(r"^State \d+:", out, flags=re.M))}
-    if code == 0 and "No error has been found" in out:
-        ok = True
-    elif violated:
-        ok = False
+    if violated:
+        ok, why = False, "counterexample"
+    elif code == 0 and "No error has been found" in out and distinct:
+        ok, why = True, ""
+    elif code == 0 and "No error has been found" in out:
+        # TLC passes a spec with no reachable states: every invariant holds vacuously
+        ok, why = None, "0 reachable states — Init is unsatisfiable, nothing was checked"
     else:
-        ok = None  # parse / semantic / config error, or timeout
+        ok, why = None, "never finished checking (parse / semantic / config error, or timeout)"
     errors = [{"msg": l.strip()} for l in out.splitlines() if l.startswith("Error:")][:20]
-    return {"ok": ok, "violated": violated, "errors": errors, "stats": stats, "log": out}
+    return {"ok": ok, "violated": violated, "errors": errors, "why": why, "stats": stats, "log": out}
 
 
 def engine_for(d):
@@ -409,7 +568,21 @@ def strip_dafny_comments(text):
     return re.sub(r"//[^\n]*|/\*.*?\*/", lambda m: re.sub(r"[^\n]", " ", m.group(0)), text, flags=re.S)
 
 
-def check_pointers(root, ref, text):
+def model_shortcut(kind, raw):
+    """A reason the model can't be trusted before it is even run, or None."""
+    if kind != "dafny":
+        return None
+    text = strip_dafny_comments(raw)
+    if not re.search(r'include\s+"rule\.dfy"', text) or not re.search(r"\brefines\b", text):
+        return 'model.dfy must `include "rule.dfy"` and declare a module that `refines` the rule module'
+    for rx, label in CHEATS:
+        for m in rx.finditer(text):
+            line = text.count("\n", 0, m.start()) + 1
+            return f"model.dfy:{line} uses {label} — not allowed, it makes the proof vacuous"
+    return None
+
+
+def check_pointers(ref, text, src):
     """Every model must point at the real code it models (`file:line`), and the lines must exist."""
     if ref.get("kind") != "code":
         return [], []
@@ -417,15 +590,61 @@ def check_pointers(root, ref, text):
     if not found:
         return [f"model has no `file:line` pointers into {ref['file']} — every function/action/step "
                 "must name the code it models"], []
-    src = root / ref["file"]
     warnings = []
     for rel, line in sorted(set(found)):
-        path = root / rel if (root / rel).is_file() else (src if Path(rel).name == src.name else None)
-        if path is None:
-            warnings.append(f"pointer {rel}:{line} doesn't resolve to a file in the repo")
-        elif int(line) > len(path.read_text().splitlines()):
-            warnings.append(f"pointer {rel}:{line} is past the end of {path.relative_to(root)}")
+        target = src.read(rel)
+        if target is None and Path(rel).name == Path(ref["file"]).name:
+            target = src.read(ref["file"])  # a bare `billing.py:42` points into the target's file
+        if target is None:
+            warnings.append(f"pointer {rel}:{line} doesn't resolve to a file in the {src.label}")
+        elif int(line) > len(target.splitlines()):
+            warnings.append(f"pointer {rel}:{line} is past the end of the file in the {src.label}")
     return [], warnings
+
+
+def evaluate(d):
+    """Run the model, then every mutant. Shared by `check` and `selftest`; touches no git state."""
+    kind, model_name, mutant_glob, rules_of, runner, _ = engine_for(d)
+    rules = rules_of(d)
+    ev = {"kind": kind, "model": model_name, "mutant_glob": mutant_glob, "rules": rules,
+          "main": runner(d, model_name), "mutants": {}, "survived": [], "invalid": [], "uncovered": []}
+    if ev["main"]["ok"] is not True:
+        ev["outcome"] = "failed"
+        return ev
+    # The model passes. Now every mutant (a deliberately broken copy) must FAIL, and between
+    # them they must break every rule — a rule never seen failing proves nothing.
+    covered = set()
+    for mut in sorted(d.glob(mutant_glob)):
+        r = runner(d, mut.name)
+        ev["mutants"][mut.name] = r
+        if r["ok"] is True:
+            ev["survived"].append(mut.name)
+        elif r["ok"] is None:
+            ev["invalid"].append(mut.name)
+        else:
+            covered |= r["violated"] & set(rules)
+    ev["uncovered"] = sorted(set(rules) - covered)
+    if not ev["mutants"]:
+        ev["outcome"] = "needs-mutants"
+    elif ev["survived"]:
+        ev["outcome"] = "mutant-survived"
+    elif ev["uncovered"]:
+        ev["outcome"] = "proved-partial"
+    else:
+        ev["outcome"] = "proved"
+    return ev
+
+
+def fmt_error(e):
+    return f"{e['file']}:{e['line']}  {e['kind']}: {e['msg']}" if "file" in e else e["msg"]
+
+
+def fmt_mutant(r):
+    if r["ok"] is True:
+        return "SURVIVED (checker missed it)"
+    if r["ok"] is None:
+        return f"INVALID ({r['why']})"
+    return "caught → " + (", ".join(sorted(r["violated"])) or "?")
 
 
 # ── commands ─────────────────────────────────────────────────────────────────
@@ -445,6 +664,7 @@ def cmd_doctor(args):
     if missing:
         print(f"not supported by this dafny, skipped: {', '.join(missing)}")
     print(f"proofs root: {PROOFS_ROOT}")
+    print("after installing or upgrading a checker, run `fv selftest`")
     return 0
 
 
@@ -454,65 +674,79 @@ def tla_doctor():
     print(f"tla2tools.jar: {jar or f'MISSING — put the release jar at {TLA_JAR_DEFAULT} (or set $TLA2TOOLS)'}")
 
 
-def default_base(root):
-    p = sh(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd=root, check=False)
-    return p.stdout.strip() if p.returncode == 0 and p.stdout.strip() else "origin/main"
-
-
 def cmd_targets(args):
     root = repo_root()
-    args.base = args.base or default_base(root)
-    ranges = changed_ranges(root, args.base)
+    src, pr = source_for(root, args)
+    base = pr["base"] if pr else (args.base or default_base(root))
     rows = []
-    for rel, hunks in sorted(ranges.items()):
-        path = root / rel
-        if not path.is_file():
-            continue
-        for name, start, end in functions_in(path, path.read_text()):
-            if hunks is not None and not any(s <= end and e >= start for s, e in hunks):
-                continue
-            d = proofs_dir(root) / slug_for(rel, name)
-            if d.is_dir():
-                state, outcome, _ = proof_state(root, d)
-            else:
-                state, outcome = "needs-proof", "-"
-            rows.append({"target": f"{rel}:{name}", "lang": LANG_BY_EXT[path.suffix],
-                         "lines": f"{start}-{end}", "proof": state, "outcome": outcome})
+    for rel, name, start, end in changed_functions(root, src, base, src.commit):
+        d = proofs_dir(root) / slug_for(rel, name)
+        if d.is_dir():
+            state, outcome, _ = proof_state(root, d, src)
+        else:
+            state, outcome = "needs-proof", "-"
+        rows.append({"target": f"{rel}:{name}", "lang": LANG_BY_EXT[Path(rel).suffix],
+                     "lines": f"{start}-{end}", "proof": state, "outcome": outcome})
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
+    print(f"# {src.label} vs {base}")
     if not rows:
-        print(f"no changed .py/.ts functions vs {args.base} (tests excluded)")
+        print("no changed .py/.ts functions (tests excluded)")
         return 0
     w = max(len(r["target"]) for r in rows)
     for r in rows:
-        print(f"{r['target']:<{w}}  {r['lang']:<10}  {r['proof']:<12}  {r['outcome']}")
+        print(f"{r['target']:<{w}}  {r['lang']:<10}  {r['proof']:<14}  {r['outcome']}")
     return 0
 
 
-def cmd_snapshot(args):
-    root = repo_root()
+def snapshot(root, src, pr, target, statement=None):
+    """Create/refresh a proof dir and pin what it covers. Returns the dir."""
     base = proofs_dir(root)
-    if args.target.startswith("english:"):
-        slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", args.target.split(":", 1)[1]).strip("-")
+    tags = {"pr": src.pr, "branch": pr["headRefName"] if pr else current_branch(root)}
+    if target.startswith("english:"):
+        slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", target.split(":", 1)[1]).strip("-")
         d = base / f"english.{slug}"
         d.mkdir(parents=True, exist_ok=True)
-        write_json(d / "source.ref", {"kind": "english", "name": slug, "statement": args.statement or ""})
-        print(d)
-        return 0
-    rel, name, lang, snippet = extract(root, args.target)
+        old = read_json(d / "source.ref", {}) or {}
+        ref = {"kind": "english", "name": slug, "statement": statement or old.get("statement", "")}
+        for k, v in tags.items():  # keep the PR/branch it was first tied to unless given a new one
+            ref[k] = v if v is not None else old.get(k)
+        write_json(d / "source.ref", ref)
+        return d
+    rel, name, lang, snippet = extract(root, target, src)
     d = base / slug_for(rel, name)
     d.mkdir(parents=True, exist_ok=True)
     old = (d / "source.sha").read_text().strip() if (d / "source.sha").exists() else None
     new = sha(snippet)
     (d / "source.sha").write_text(new + "\n")
-    write_json(d / "source.ref", {"kind": "code", "file": rel, "name": name, "lang": lang})
+    write_json(d / "source.ref", {"kind": "code", "file": rel, "name": name, "lang": lang,
+                                  "snapshot_of": src.label, **tags})
     if old and old != new:
         # source moved on: the old verdict no longer describes this code
         result = read_json(d / "result.json", {}) or {}
         result.update({"outcome": "unchecked", "attempts": 0, "note": "source changed since last check"})
         write_json(d / "result.json", result)
-    print(d)
+    return d
+
+
+def cmd_snapshot(args):
+    root = repo_root()
+    src, pr = source_for(root, args)
+    print(snapshot(root, src, pr, args.target, args.statement))
+    return 0
+
+
+def cmd_skip(args):
+    root = repo_root()
+    if args.target.startswith("english:"):
+        sys.exit("fv: skip is for a changed function; an english: target is never in the diff")
+    src, pr = source_for(root, args)
+    d = snapshot(root, src, pr, args.target)
+    result = read_json(d / "result.json", {}) or {}
+    result.update({"outcome": "skipped", "note": args.note, "marked_at": now()})
+    write_json(d / "result.json", result)
+    print(f"{d.name}: skipped — {args.note}")
     return 0
 
 
@@ -530,52 +764,53 @@ def cmd_approve(args):
     return 0
 
 
-def fmt_error(e):
-    return f"{e['file']}:{e['line']}  {e['kind']}: {e['msg']}" if "file" in e else e["msg"]
-
-
 def cmd_check(args):
     root = repo_root()
     d = resolve_dir(root, args.dir)
-    kind, model_name, mutant_glob, rules_of, runner, rule_names = engine_for(d)
+    src, _ = source_for(root, args)
+    kind, model_name, _, rules_of, _, rule_names = engine_for(d)
     for f in [*rule_names, model_name]:
         if not (d / f).exists():
             sys.exit(f"fv: {d / f} missing")
-    state, _, ref = proof_state(root, d)
+    state, _, ref = proof_state(root, d, src)
+    if state == "no-source-ref":
+        sys.exit(f"fv: {d.name} has no usable source.ref — create it with `fv snapshot`")
     if state in ("unapproved", "rule-changed"):
         sys.exit(f"fv: rule files are {state} — the user must approve them (`fv approve {d.name}`) before checking")
     if state == "stale":
-        sys.exit("fv: source changed since snapshot — re-run `fv snapshot` and re-check the model")
+        sys.exit(f"fv: source changed since snapshot ({src.label}) — re-run `fv snapshot` and re-check the model")
+    if state == "source-missing":
+        hint = f" — it was snapshotted from PR #{ref['pr']}; re-run with `--pr {ref['pr']}`" if ref.get("pr") and not src.pr else ""
+        sys.exit(f"fv: {ref.get('file')}:{ref.get('name')} not found in the {src.label}{hint}")
     raw = (d / model_name).read_text()
-    if kind == "dafny":
-        text = strip_dafny_comments(raw)
-        if not re.search(r'include\s+"rule\.dfy"', text) or not re.search(r"\brefines\b", text):
-            sys.exit('fv: model.dfy must `include "rule.dfy"` and declare a module that `refines` the rule module')
-        for rx, label in CHEATS:
-            for m in rx.finditer(text):
-                line = text.count("\n", 0, m.start()) + 1
-                sys.exit(f"fv: model.dfy:{line} uses {label} — not allowed, it makes the proof vacuous")
-    pointer_errors, pointer_warnings = check_pointers(root, ref, raw)
+    bad = model_shortcut(kind, raw)
+    if bad:
+        sys.exit("fv: " + bad)
+    pointer_errors, pointer_warnings = check_pointers(ref, raw, src)
     if pointer_errors:
         sys.exit("fv: " + "; ".join(pointer_errors))
-    rules = rules_of(d)
-    if not rules:
+    if not rules_of(d):
         sys.exit("fv: no rules found — rule.dfy needs `ensures` lines, rule.cfg needs INVARIANT/PROPERTY entries")
 
     started = datetime.datetime.now()
-    main = runner(d, model_name)
-    log = [f"===== {model_name}", main["log"]]
+    ev = evaluate(d)
+    main = ev["main"]
+    log = [f"===== {model_name}", main["log"]] + [x for n, r in ev["mutants"].items() for x in (f"===== {n}", r["log"])]
     result = read_json(d / "result.json", {}) or {}
-    result.update({"engine": kind, "checked_at": now(), "commit": git_head(root), "note": "",
-                   "rules": sorted(rules), "stats": main["stats"], "errors": main["errors"],
-                   "pointer_warnings": pointer_warnings, "mutants": {}})
+    result.update({"engine": kind, "checked_at": now(), "checked_against": src.label,
+                   "commit": src.commit or git_head(root), "note": "", "rules": sorted(ev["rules"]),
+                   "bounds": tla_bounds(d) if kind == "tla" else None,
+                   "stats": main["stats"], "errors": main["errors"], "pointer_warnings": pointer_warnings,
+                   "mutants": {n: {"ok": r["ok"], "violated": sorted(r["violated"]), "why": r["why"]}
+                               for n, r in ev["mutants"].items()}})
 
-    if main["ok"] is not True:
+    if ev["outcome"] == "failed":
         attempts = int(result.get("attempts", 0)) + 1
         result.update({"outcome": "failed", "attempts": attempts})
         finish(d, result, log, started)
         broken = ", ".join(sorted(main["violated"])) or "-"
-        print(f"FAILED  {d.name}  attempt {attempts}/{MAX_ATTEMPTS}  rules broken: {broken}  log: {d / 'last.log'}")
+        print(f"FAILED  {d.name}  attempt {attempts}/{MAX_ATTEMPTS}  ({main['why']})  rules broken: {broken}  "
+              f"log: {d / 'last.log'}")
         for e in main["errors"][:10]:
             print("  " + fmt_error(e))
         if not main["errors"]:
@@ -584,44 +819,19 @@ def cmd_check(args):
             print(f"attempt cap reached — stop and `fv mark {d.name} gave_up` (or a counterexample outcome)")
         return 1
 
-    # The model passes. Now every mutant (a deliberately broken copy) must FAIL, and between
-    # them they must break every rule — a rule never seen failing proves nothing.
-    covered, survived, invalid = set(), [], []
-    for mut in sorted(d.glob(mutant_glob)):
-        r = runner(d, mut.name)
-        log += [f"===== {mut.name}", r["log"]]
-        result["mutants"][mut.name] = {"ok": r["ok"], "violated": sorted(r["violated"])}
-        if r["ok"] is True:
-            survived.append(mut.name)
-        elif r["ok"] is None:
-            invalid.append(mut.name)
-        else:
-            covered |= r["violated"] & set(rules)
-    uncovered = sorted(set(rules) - covered)
-    if not result["mutants"]:
-        outcome = "needs-mutants"
-    elif survived:
-        outcome = "mutant-survived"
-    elif uncovered:
-        outcome = "proved-partial"
-    else:
-        outcome = "proved"
-    result.update({"outcome": outcome, "attempts": 0, "uncovered_rules": uncovered,
-                   "invalid_mutants": invalid, "survived_mutants": survived})
+    result.update({"outcome": ev["outcome"], "attempts": 0, "uncovered_rules": ev["uncovered"],
+                   "invalid_mutants": ev["invalid"], "survived_mutants": ev["survived"]})
     finish(d, result, log, started)
-
-    print(f"{outcome.upper()}  {d.name}  ({kind}, {result['seconds']}s, stats {main['stats']})")
-    for name, m in result["mutants"].items():
-        verdict = {True: "SURVIVED (checker missed it)", None: "INVALID (never reached the checker)",
-                   False: "caught → " + (", ".join(m["violated"]) or "?")}[m["ok"]]
-        print(f"  mutant {name}: {verdict}")
-    if outcome == "needs-mutants":
-        print(f"  write at least one {mutant_glob} per rule; until then this is not a proof")
-    for rid in uncovered:
-        print(f"  rule never shown failing: {rid}  {rules[rid] if rules[rid] != rid else ''}".rstrip())
+    print(f"{ev['outcome'].upper()}  {d.name}  ({kind}, {result['seconds']}s, stats {main['stats']})")
+    for name, r in ev["mutants"].items():
+        print(f"  mutant {name}: {fmt_mutant(r)}")
+    if ev["outcome"] == "needs-mutants":
+        print(f"  write at least one {ev['mutant_glob']} per rule; until then this is not a proof")
+    for rid in ev["uncovered"]:
+        print(f"  rule never shown failing: {rid}  {ev['rules'][rid] if ev['rules'][rid] != rid else ''}".rstrip())
     for w in pointer_warnings:
         print(f"  warning: {w}")
-    return 0 if outcome == "proved" else 1
+    return 0 if ev["outcome"] == "proved" else 1
 
 
 def git_head(root):
@@ -635,12 +845,14 @@ def finish(d, result, log, started):
     write_json(d / "result.json", result)
 
 
-OUTCOMES = ["bug", "model-mismatch", "unconfirmed", "gave_up"]
+OUTCOMES = ["bug", "model-mismatch", "unconfirmed", "gave_up", "skipped"]
 
 
 def cmd_mark(args):
     root = repo_root()
     d = resolve_dir(root, args.dir)
+    if args.outcome == "skipped" and not args.note:
+        sys.exit("fv: a skip needs --note saying why (e.g. 'plumbing: only forwards to the gRPC client')")
     result = read_json(d / "result.json", {}) or {}
     result.update({"outcome": args.outcome, "note": args.note or "", "marked_at": now()})
     write_json(d / "result.json", result)
@@ -648,83 +860,288 @@ def cmd_mark(args):
     return 0
 
 
-def status_rows(root):
-    rows = []
-    for d in all_proofs(root):
-        state, outcome, ref = proof_state(root, d)
-        target = f"{ref.get('file')}:{ref.get('name')}" if ref.get("kind") == "code" else f"english:{ref.get('name', d.name)}"
-        rows.append({"dir": d.name, "target": target, "state": state, "outcome": outcome})
-    return rows
+def proof_row(root, d, src, target=None):
+    state, outcome, ref = proof_state(root, d, src)
+    result = read_json(d / "result.json", {}) or {}
+    if target is None:
+        target = (f"{ref.get('file')}:{ref.get('name')}" if ref.get("kind") == "code"
+                  else f"english:{ref.get('name', d.name)}")
+    # a verdict counts only while the code and the approved rules are what was checked
+    verdict = state if state in NOT_CURRENT else outcome
+    return {"target": target, "dir": d.name, "state": state, "outcome": outcome, "verdict": verdict,
+            "engine": result.get("engine") if outcome != "skipped" else None,
+            "note": result.get("note", ""), "rules": len(result.get("rules", [])),
+            "caught": sum(1 for m in (result.get("mutants") or {}).values() if m.get("ok") is False),
+            "bounds": result.get("bounds"), "statement": ref.get("statement", "")}
 
 
 def cmd_status(args):
     root = repo_root()
-    rows = status_rows(root)
+    src, _ = source_for(root, args)
+    rows = [proof_row(root, d, src) for d in all_proofs(root)]
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
     if not rows:
-        print(f"no proofs yet for {root.name} ({proofs_dir(root)})")
+        print(f"no proofs yet for {repo_name(root)} ({proofs_dir(root)})")
         return 0
     w = max(len(r["target"]) for r in rows)
     for r in rows:
         print(f"{r['target']:<{w}}  {r['state']:<14}  {r['outcome']}")
     return 0
+
+
+def report_rows(root, src, pr, args):
+    """(title, rows) for the report's scope: a PR, the current diff, or every proof (--all)."""
+    if args.all:
+        return f"all proofs in {repo_name(root)} ({src.label})", [proof_row(root, d, src) for d in all_proofs(root)]
+    base = pr["base"] if pr else (args.base or default_base(root))
+    branch = pr["headRefName"] if pr else current_branch(root)
+    title = (f"PR #{pr['number']} @ `{src.commit[:10]}` vs `{base}`" if pr
+             else f"`{branch or git_head(root)}` (working tree) vs `{base}`")
+    rows = []
+    for rel, name, _, _ in changed_functions(root, src, base, src.commit):
+        d = proofs_dir(root) / slug_for(rel, name)
+        target = f"{rel}:{name}"
+        if d.is_dir():
+            rows.append(proof_row(root, d, src, target))
+        else:
+            rows.append({"target": target, "dir": None, "state": "needs-proof", "outcome": "-",
+                         "verdict": "needs-proof", "engine": None, "note": "", "rules": 0, "caught": 0,
+                         "bounds": None, "statement": ""})
+    # plain-English proofs aren't in any diff: include those tied to this PR or its branch
+    for d in all_proofs(root):
+        ref = read_json(d / "source.ref", {}) or {}
+        if ref.get("kind") == "english" and (
+                (pr and ref.get("pr") == pr["number"]) or (branch and ref.get("branch") == branch)):
+            rows.append(proof_row(root, d, src))
+    return title, rows
+
+
+def cell(text):
+    """Markdown-table-safe: one line, no bare pipes."""
+    return " ".join(str(text).split()).replace("|", "\\|")
+
+
+def result_text(r):
+    v = r["verdict"]
+    if v == "proved":
+        text = f"proved — {r['rules']} rule(s), {r['caught']} mutant(s) caught"
+        if r["bounds"]:
+            text += f"; bounds: {r['bounds']}"
+        return text
+    if v in STATE_TEXT:
+        return STATE_TEXT[v].format(outcome=r["outcome"])
+    return f"{v} — {r['note']}" if r["note"] else v
+
+
+STATE_TEXT = {
+    "needs-proof": "needs proof — not triaged yet",
+    "unapproved": "rules drafted, awaiting approval",
+    "rule-changed": "rules edited after approval — re-approve and re-check (was: {outcome})",
+    "stale": "code changed since the last check — re-snapshot and re-check (was: {outcome})",
+    "source-missing": "function no longer in the code (was: {outcome})",
+    "no-source-ref": "proof dir has no usable source.ref — re-snapshot",
+}
 
 
 def cmd_report(args):
     root = repo_root()
-    rows = status_rows(root)
-    if not rows:
-        print("nothing to report")
-        return 0
+    src, pr = source_for(root, args)
+    title, rows = report_rows(root, src, pr, args)
+    if args.json:
+        print(json.dumps({"title": title, "rows": rows}, indent=2))
+    else:
+        print(f"### Formal verification — {title}")
+        print()
+        if rows:
+            print("| Target | Tool | Result |")
+            print("|---|---|---|")
+            for r in rows:
+                label = f"`{r['target']}`" + (f" “{r['statement']}”" if r["statement"] else "")
+                print(f"| {cell(label)} | {ENGINE_LABEL.get(r['engine'], '—')} | {cell(result_text(r))} |")
+        else:
+            print("No changed .py/.ts functions (tests excluded) and no plain-English proofs tied to this change.")
+        print()
+        print("Caveats: a proof covers the model, not the code; Dafny `real` is exact math, not IEEE floats; "
+              "TLA+ results hold only within the listed bounds; a proof covers only the approved rules.")
+        print()
+    order = ["proved", "skipped", "proved-partial", "needs-mutants", "mutant-survived", "bug", "model-mismatch",
+             "unconfirmed", "gave_up", "failed", "unchecked", "needs-proof", "stale", "rule-changed",
+             "unapproved", "source-missing", "no-source-ref"]
     counts = {}
     for r in rows:
-        # a verdict only counts while the code and the approved rules are what was checked
-        key = r["outcome"] if r["state"] in ("fresh", "english") else r["state"]
-        counts[key] = counts.get(key, 0) + 1
-    w = max(len(r["target"]) for r in rows)
-    print(f"{'target':<{w}}  {'state':<14}  outcome")
-    for r in rows:
-        print(f"{r['target']:<{w}}  {r['state']:<14}  {r['outcome']}")
-    order = ["proved", "proved-partial", "needs-mutants", "mutant-survived", "bug", "model-mismatch",
-             "unconfirmed", "gave_up", "failed", "unchecked", "stale", "rule-changed", "unapproved",
-             "source-missing"]
-    summary = ", ".join(f"{counts[k]} {k}" for k in order if counts.get(k))
-    print()
-    print("Caveats: a proof covers the model, not the code; Dafny `real` is exact math, not IEEE floats; "
-          "TLA+ results hold only within the bounds in rule.cfg; a proof covers only the approved rules.")
-    print()
-    print("Proof of Validation row:")
-    print(f"| `fv report` (Dafny, {len(rows)} targets) | {summary} |")
+        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+    summary = ", ".join(f"{counts[k]} {k}" for k in order if counts.get(k)) or "nothing to verify"
+    summary += "".join(f", {n} {k}" for k, n in counts.items() if k not in order)
+    engines = sorted({ENGINE_LABEL[r["engine"]] for r in rows if r["engine"] in ENGINE_LABEL})
+    cmd = "fv report" + (f" --pr {pr['number']}" if pr else " --all" if args.all
+                         else f" --base {args.base}" if args.base else "")
+    where = f" (head `{src.commit[:10]}`)" if src.commit else ""
+    if not args.json:
+        print("Proof of Validation row:")
+        print(f"| `{cmd}` ({', '.join(engines) or 'no checker run'}) | {summary}{where} |")
+    open_rows = [r["target"] for r in rows if r["verdict"] not in GATE_OK]
+    if open_rows:
+        print(f"fv: {len(open_rows)} target(s) not proved or skipped: {', '.join(open_rows)}", file=sys.stderr)
+        return 1
     return 0
+
+
+# ── selftest: the negative controls, so a checker upgrade can't silently break parsing ──
+
+ST_DFY_RULE = """abstract module Rule {
+  // clamp x into [lo, hi]
+  method Clamp(x: int, lo: int, hi: int) returns (r: int)
+    requires lo <= hi
+    ensures lo <= r
+    ensures r <= hi
+}
+"""
+
+
+def st_dfy_model(body):
+    if body is None:
+        return 'include "rule.dfy"\nmodule Model refines Rule { }\n'
+    return ('include "rule.dfy"\nmodule Model refines Rule {\n'
+            f"  method Clamp(x: int, lo: int, hi: int) returns (r: int) {{\n    {body}\n  }}\n}}\n")
+
+
+ST_TLA_RULE = "---- MODULE rule ----\nEXTENDS Model\nBounded == x <= 3\nNonNeg == x >= 0\n====\n"
+ST_TLA_CFG = "SPECIFICATION Spec\nINVARIANT Bounded NonNeg\n"
+
+
+def st_tla_model(nxt, init="x = 0", extra=""):
+    return ("---- MODULE Model ----\nEXTENDS Integers\nVARIABLE x\nvars == <<x>>\n"
+            f"Init == {init}\n{extra}\nNext == {nxt}\nSpec == Init /\\ [][Next]_vars\n====\n")
+
+
+def st_case(tmp, name, files):
+    d = tmp / name
+    d.mkdir()
+    for fname, text in files.items():
+        (d / fname).write_text(text)
+    return d
+
+
+def cmd_selftest(args):
+    good_dfy = "r := if x < lo then lo else if x > hi then hi else x;"
+    count_to = lambda n: f"(x < {n} /\\ x' = x + 1) \\/ (x = {n} /\\ UNCHANGED x)"  # noqa: E731
+    down_to = "(x > -1 /\\ x' = x - 1) \\/ (x = -1 /\\ UNCHANGED x)"
+    cases = []  # (engine, description, build files, predicate on evaluate() result)
+    cases += [
+        ("dafny", "correct model + one mutant per ensures → proved, each mutant mapped to its rule line",
+         {"rule.dfy": ST_DFY_RULE, "model.dfy": st_dfy_model(good_dfy),
+          "mutant_no_lo.dfy": st_dfy_model("r := if x > hi then hi else x;"),
+          "mutant_no_hi.dfy": st_dfy_model("r := if x < lo then lo else x;")},
+         lambda ev: ev["outcome"] == "proved"
+         and ev["mutants"]["mutant_no_lo.dfy"]["violated"] == {"rule.dfy:5"}
+         and ev["mutants"]["mutant_no_hi.dfy"]["violated"] == {"rule.dfy:6"}),
+        ("dafny", "refinement with no body → never passes",
+         {"rule.dfy": ST_DFY_RULE, "model.dfy": st_dfy_model(None)},
+         lambda ev: ev["main"]["ok"] is not True),
+        ("dafny", "body breaking one ensures → counterexample naming exactly that line",
+         {"rule.dfy": ST_DFY_RULE, "model.dfy": st_dfy_model("r := if x < lo then lo else x;")},
+         lambda ev: ev["main"]["ok"] is False and ev["main"]["violated"] == {"rule.dfy:6"}),
+        ("dafny", "body-less mutant → INVALID, not caught",
+         {"rule.dfy": ST_DFY_RULE, "model.dfy": st_dfy_model(good_dfy), "mutant_empty.dfy": st_dfy_model(None)},
+         lambda ev: ev["mutants"]["mutant_empty.dfy"]["ok"] is None and ev["outcome"] == "proved-partial"),
+        ("tla", "correct model + one mutant per invariant → proved, each mutant mapped to its invariant",
+         {"rule.tla": ST_TLA_RULE, "rule.cfg": ST_TLA_CFG, "Model.tla": st_tla_model(count_to(3)),
+          "mutant_overshoot.tla": st_tla_model(count_to(4)), "mutant_decrement.tla": st_tla_model(down_to)},
+         lambda ev: ev["outcome"] == "proved"
+         and ev["mutants"]["mutant_overshoot.tla"]["violated"] == {"Bounded"}
+         and ev["mutants"]["mutant_decrement.tla"]["violated"] == {"NonNeg"}),
+        ("tla", "Next that breaks an invariant → counterexample naming it",
+         {"rule.tla": ST_TLA_RULE, "rule.cfg": ST_TLA_CFG, "Model.tla": st_tla_model(count_to(5))},
+         lambda ev: ev["main"]["ok"] is False and ev["main"]["violated"] == {"Bounded"}),
+        ("tla", "Next == UNCHANGED vars + mutant of a dead action → mutant-survived",
+         {"rule.tla": ST_TLA_RULE, "rule.cfg": ST_TLA_CFG, "Model.tla": st_tla_model("UNCHANGED vars"),
+          "mutant_dead_action.tla": st_tla_model("UNCHANGED vars", extra="Inc == x' = x + 10")},
+         lambda ev: ev["outcome"] == "mutant-survived"),
+        ("tla", "unsatisfiable Init (0 reachable states) → never passes",
+         {"rule.tla": ST_TLA_RULE, "rule.cfg": ST_TLA_CFG, "Model.tla": st_tla_model("UNCHANGED vars", "x = 0 /\\ x = 1")},
+         lambda ev: ev["main"]["ok"] is None),
+        ("tla", "mutant with a syntax error → INVALID, not caught",
+         {"rule.tla": ST_TLA_RULE, "rule.cfg": ST_TLA_CFG, "Model.tla": st_tla_model(count_to(3)),
+          "mutant_syntax.tla": "---- MODULE Model ----\nEXTENDS Integers\nVARIABLE x\nInit == x = \n====\n"},
+         lambda ev: ev["mutants"]["mutant_syntax.tla"]["ok"] is None),
+    ]
+    have = {"dafny": bool(shutil.which("dafny")), "tla": bool(find_java() and find_tla_jar())}
+    failed = ran = 0
+    # static gate: a model using a proof shortcut is refused before any checker runs
+    shortcut = model_shortcut("dafny", st_dfy_model("assume x > 0; r := x;"))
+    ok = bool(shortcut and "assume" in shortcut)
+    print(f"{'PASS' if ok else 'FAIL'}  static  model using `assume` is refused before checking")
+    failed += not ok
+    tmp = Path(tempfile.mkdtemp(prefix="fv-selftest-"))
+    try:
+        for i, (engine, desc, files, pred) in enumerate(cases):
+            if not have[engine]:
+                print(f"SKIP  {engine:<6}  {desc}  ({engine} not installed — `fv doctor`)")
+                continue
+            ev = evaluate(st_case(tmp, f"case{i}", files))
+            ran += 1
+            try:
+                ok = bool(pred(ev))
+            except KeyError:
+                ok = False
+            failed += not ok
+            print(f"{'PASS' if ok else 'FAIL'}  {engine:<6}  {desc}")
+            if not ok:
+                print(f"        got: outcome={ev['outcome']}  model ok={ev['main']['ok']} ({ev['main']['why']}) "
+                      f"violated={sorted(ev['main']['violated'])}  "
+                      + "  ".join(f"{n}: {fmt_mutant(r)}" for n, r in ev["mutants"].items()))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"\n{ran} checker control(s) ran, {failed} failed")
+    if failed:
+        print("fv's reading of checker output is broken — fix the parsing in fv before trusting any PROVED")
+    return 1 if failed or not ran else 0
 
 
 def main():
     ap = argparse.ArgumentParser(prog="fv", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    pr_help = "read the code from this PR's head commit (gh + git fetch; the working tree is untouched)"
     sub.add_parser("doctor")
+    sub.add_parser("selftest")
     p = sub.add_parser("targets")
-    p.add_argument("--base", help="default: the remote's default branch (origin/HEAD), else origin/main")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--base", help="default: the remote's default branch (origin/HEAD), else origin/main")
+    g.add_argument("--pr", type=int, help=pr_help)
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("snapshot")
     p.add_argument("target")
     p.add_argument("--statement", help="plain-English statement, for english:<slug> targets")
+    p.add_argument("--pr", type=int, help=pr_help + "; an english: target is tied to this PR in reports")
+    p = sub.add_parser("skip")
+    p.add_argument("target", help="<file>:<function> from `fv targets`")
+    p.add_argument("--note", required=True, help="why it isn't worth a proof, e.g. 'plumbing: logging only'")
+    p.add_argument("--pr", type=int, help=pr_help)
     p = sub.add_parser("approve")
     p.add_argument("dir")
     p = sub.add_parser("check")
     p.add_argument("dir")
+    p.add_argument("--pr", type=int, help=pr_help)
     p = sub.add_parser("mark")
     p.add_argument("dir")
     p.add_argument("outcome", choices=OUTCOMES)
     p.add_argument("--note")
     p = sub.add_parser("status")
+    p.add_argument("--pr", type=int, help=pr_help)
     p.add_argument("--json", action="store_true")
-    sub.add_parser("report")
+    p = sub.add_parser("report")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--base", help="report the current diff vs this base (default: origin/HEAD)")
+    g.add_argument("--pr", type=int, help="report PR N's changed functions, read from its head commit")
+    g.add_argument("--all", action="store_true", help="every proof in this repo, not just the diff")
+    p.add_argument("--json", action="store_true")
     args = ap.parse_args()
     handler = {
-        "doctor": cmd_doctor, "targets": cmd_targets, "snapshot": cmd_snapshot, "approve": cmd_approve,
-        "check": cmd_check, "mark": cmd_mark, "status": cmd_status, "report": cmd_report,
+        "doctor": cmd_doctor, "selftest": cmd_selftest, "targets": cmd_targets, "snapshot": cmd_snapshot,
+        "skip": cmd_skip, "approve": cmd_approve, "check": cmd_check, "mark": cmd_mark,
+        "status": cmd_status, "report": cmd_report,
     }[args.cmd]
     sys.exit(handler(args))
 
